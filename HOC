@@ -1,0 +1,245 @@
+import numpy as np
+import pandas as pd
+from scipy.stats import gaussian_kde
+from sklearn.preprocessing import MinMaxScaler
+from collections import defaultdict
+
+# ========== Read Data ==========
+fPath = r'....csv'
+dataMatrix = np.array(pd.read_csv(fPath, header=None, skiprows=1))
+print(np.shape(dataMatrix))
+
+# ========== parameters setting ==========
+b = 1
+c = 3
+
+select = range(7129)  # data size
+feature_data = dataMatrix[:, select]
+labels = dataMatrix[:, -1]
+
+# Normalize data
+scaler = MinMaxScaler()
+feature_data = scaler.fit_transform(feature_data)
+
+unique_labels = np.unique(labels)
+n_samples = feature_data.shape[0]
+n_features = len(select)
+
+# ========== Initialize Matrix ==========
+select_mask_matrix = np.zeros((n_features, n_samples), dtype=np.uint32)
+
+# Store the number of selected samples per feature
+feature_selected_counts = []
+
+# Cache for storing overlap area for each feature
+overlap_area_cache = {}
+
+cross_points_all = []
+all_selected_samples = []
+selected_samples_per_feature = {}
+skip = []
+
+# ========== Process each feature ==========
+for feat_global_idx in range(feature_data.shape[1]):
+    print(f"Processing feature {feat_global_idx}")
+    feature_values = feature_data[:, feat_global_idx]
+
+    if np.std(feature_values) <= 0.1:
+        print(f"Skip feature {feat_global_idx} due to low std")
+        skip.append(feat_global_idx)
+        for i in range(feature_data.shape[0]):
+            select_mask_matrix[feat_global_idx, i] = i + 1
+        feature_selected_counts.append((feat_global_idx, feature_data.shape[1]))
+        overlap_area_cache[feat_global_idx] = 1e9
+        continue
+
+    cross_points_current_feature = []
+
+    # KDE modeling for all classes
+    kde_list = []
+    all_area = []
+    for label in unique_labels:
+        class_values = feature_values[labels == label]
+        kde_list.append(gaussian_kde(class_values))
+        for kde in kde_list:
+            x_range = np.linspace(min(feature_values), max(feature_values), 1000)
+            y = kde(x_range)
+            all_area.append(np.trapz(y, x_range))
+
+    # Find intersections between every pair of classes
+    for i in range(len(unique_labels)):
+        for j in range(i + 1, len(unique_labels)):
+            kde1 = kde_list[i]
+            kde2 = kde_list[j]
+
+            x_range = np.linspace(min(feature_values), max(feature_values), 1000)
+            y1 = kde1(x_range)
+            y2 = kde2(x_range)
+
+            diff = y1 - y2
+            sign_changes = np.where(np.diff(np.sign(diff)))[0]
+
+            if len(sign_changes) == 0:
+                print(f"Feature {feat_global_idx} has no intersection between class {unique_labels[i]} and class {unique_labels[j]}")
+                continue
+
+            for idx in sign_changes:
+                x0, x1_ = x_range[idx], x_range[idx + 1]
+                y0, y1_ = diff[idx], diff[idx + 1]
+                cross_x = x0 - y0 * (x1_ - x0) / (y1_ - y0)
+                cross_points_current_feature.append(cross_x)
+
+    cross_points_all.append(sorted(cross_points_current_feature))
+
+    cross_points_sorted = sorted(cross_points_current_feature)
+    all_intervals = []
+
+    intervals = [(min(feature_values)-1e-7, cross_points_sorted[0])]
+    for i in range(1, len(cross_points_sorted)):
+        intervals.append((cross_points_sorted[i - 1], cross_points_sorted[i]))
+    intervals.append((cross_points_sorted[-1], max(feature_values)+1e-7))
+
+    dominant_intervals = defaultdict(list)
+    merged_intervals_per_class = defaultdict(list)
+
+    current_class = None
+    current_start = None
+    current_end = None
+    area_label = []
+    area_max = []
+
+    for interval in intervals:
+        left, right = interval
+        area_per_class = {}
+        for i, kde in enumerate(kde_list):
+            x_range = np.linspace(left, right, 500)
+            y = kde(x_range)
+            area = np.trapz(y, x_range)
+            area_per_class[unique_labels[i]] = area
+            area_label.append(area)
+            area_max.append(max(area_label))
+
+        dominant_class = max(area_per_class, key=area_per_class.get)
+
+        if current_class == dominant_class:
+            current_end = right
+        else:
+            if current_class is not None:
+                merged_intervals_per_class[current_class].append((current_start, current_end))
+            current_class = dominant_class
+            current_start = left
+            current_end = right
+
+    if current_class is not None:
+        merged_intervals_per_class[current_class].append((current_start, current_end))
+
+    dominant_intervals = merged_intervals_per_class
+
+    # ========== Filter Abnormal Regions ==========
+    final_dominant_intervals = defaultdict(list)
+
+    for label, intervals in merged_intervals_per_class.items():
+        areas = []
+        for interval in intervals:
+            left, right = interval
+            x_range = np.linspace(left, right, 500)
+            y = kde_list[list(unique_labels).index(label)](x_range)
+            area = np.trapz(y, x_range)
+            areas.append(area)
+
+        if len(areas) == 0:
+            continue
+
+        avg_area = np.mean(areas)
+        for idx, interval in enumerate(intervals):
+            if areas[idx] >= 0.5 * avg_area:
+                final_dominant_intervals[label].append(interval)
+            else:
+                print(f"Interval {interval} has too small area ({areas[idx]:.3f} < 50% of average {avg_area:.3f}), discarded.")
+
+    dominant_intervals = final_dominant_intervals
+
+    all_selected_samples = []
+
+    for i, class_label in enumerate(unique_labels):
+        class_indices = np.where(labels == class_label)[0]
+        class_feat_values = feature_values[class_indices]
+        class_dominant_ranges = dominant_intervals[class_label]
+
+        for idx, val in zip(class_indices, class_feat_values):
+            in_any_range = any(left <= val <= right for left, right in class_dominant_ranges)
+
+            if not in_any_range:
+                boundary_distances = []
+                for left, right in class_dominant_ranges:
+                    dist = min(abs(val - left), abs(val - right))
+                    boundary_distances.append((dist, left, right))
+                if boundary_distances:
+                    min_dist, near_left, near_right = min(boundary_distances)
+                    nearest_boundary = near_left if abs(val - near_left) < abs(val - near_right) else near_right
+                else:
+                    nearest_boundary = None
+                all_selected_samples.append((idx, class_label, np.abs(val + 1)))
+
+    all_selected_samples = list(dict.fromkeys(all_selected_samples))
+    selected_count = len(all_selected_samples)
+    feature_selected_counts.append((feat_global_idx, selected_count))
+    all_selected_samples.sort(key=lambda x: x[2])
+
+    for rank, (sample_idx, _, _) in enumerate(all_selected_samples, start=1):
+        select_mask_matrix[feat_global_idx, sample_idx] = rank
+
+    selected_samples_per_feature[feat_global_idx] = all_selected_samples.copy()
+
+    x_range = np.linspace(min(feature_values), max(feature_values), 1000)
+    kde_densities = np.array([kde(x_range) for kde in kde_list])
+    min_density = np.min(kde_densities, axis=0)
+    overlap_area = np.trapz(min_density, x_range)
+    overlap_area_cache[feat_global_idx] = overlap_area
+    all_selected_samples.clear()
+
+min_feat_idx = min(overlap_area_cache, key=overlap_area_cache.get)
+min_overlap = overlap_area_cache[min_feat_idx]
+print(f"Feature with minimum overlap area is {min_feat_idx}, overlap area = {min_overlap:.6f}")
+
+# ========== Sort by Number of Abnormal Samples ==========
+feature_selected_counts.sort(key=lambda x: x[1])
+sorted_feature_indices = [feat_global_idx for feat_global_idx, _ in feature_selected_counts]
+
+print("\nAll features sorted by number of selected (abnormal) samples:")
+for idx, (feat_global_idx, selected_count) in enumerate(feature_selected_counts):
+    print(f"Rank {idx + 1}: Feature {feat_global_idx}, selected sample count = {selected_count}")
+
+# ========== Output Feature with Fewest Abnormal Samples ==========
+min_selected_feature = feature_selected_counts[0][0]
+min_selected_count = feature_selected_counts[0][1]
+min_selected_feature_mask = select_mask_matrix[min_selected_feature, :]
+
+print(f"\nFeature with fewest abnormal samples: Feature {min_selected_feature}, count = {min_selected_count}")
+print(f"Mask vector of feature {min_selected_feature} (rank from 1, 0 = normal sample):")
+print(min_selected_feature_mask)
+
+print("\nSorted feature indices (ascending by number of abnormal samples):")
+print(sorted_feature_indices)
+
+# ========== Calculate Combined Score: Overlap Area + Std ==========
+min_feature_mask = select_mask_matrix[select.index(min_selected_feature), :]
+current_mask = min_feature_mask
+feature_scores = []
+
+for feat_idx, feat_global_idx in enumerate(select):
+    if feat_global_idx == min_selected_feature:
+        continue
+
+    other_feature_mask = select_mask_matrix[feat_idx, :]
+    combined_mask = current_mask + other_feature_mask
+    overlap_area = overlap_area_cache[feat_global_idx]
+    std = np.std(combined_mask)
+    score = overlap_area * b + std * c
+    feature_scores.append((feat_global_idx, score))
+
+feature_scores.sort(key=lambda x: x[1])
+best_match_feature = feature_scores[0][0]
+best_match_score = feature_scores[0][1]
+
+print(f"Feature with best combination score when added to feature {min_selected_feature} is feature {best_match_feature}, score = {best_match_score:.6f}")
